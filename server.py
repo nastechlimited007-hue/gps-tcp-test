@@ -1,5 +1,99 @@
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime, timezone
+
+HOST = "0.0.0.0"
+PORT = int(os.getenv("PORT", "7018"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("gt06-server")
 
 
+def crc16_itu(data: bytes) -> int:
+    """GT06 CRC-ITU: reflected polynomial 0x8408, init 0xFFFF, xorout 0xFFFF."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x8408 if crc & 1 else crc >> 1
+    return crc ^ 0xFFFF
+
+
+def packet_crc_ok(packet: bytes) -> bool:
+    # GT06 packet: 78 78 LEN ... CRC_H CRC_L 0D 0A
+    if len(packet) < 9 or packet[:2] != b"\x78\x78" or packet[-2:] != b"\x0d\x0a":
+        return False
+    expected = crc16_itu(packet[2:-4])
+    received = int.from_bytes(packet[-4:-2], "big")
+    return expected == received
+
+
+def make_ack(protocol: int, serial: bytes) -> bytes:
+    # Response format in the supplied CY05/CY06 GT06 protocol:
+    # 78 78 05 <protocol> <serial:2> <CRC:2> 0D 0A
+    body = bytes([0x05, protocol]) + serial
+    crc = crc16_itu(body).to_bytes(2, "big")
+    return b"\x78\x78" + body + crc + b"\x0d\x0a"
+
+
+def decode_location(packet: bytes) -> dict:
+    """
+    Decode common GT06 GPS fields for protocols 0x12, 0x22, 0xA0 and 0x32.
+    Protocol variants can add fields after the common GPS section; this intentionally
+    extracts only the common timestamp/latitude/longitude/speed/course fields.
+    """
+    # packet indexes: 0-1 start, 2 length, 3 protocol, then 6-byte UTC timestamp
+    if len(packet) < 22:
+        return {"decode_error": "packet too short for common GPS fields"}
+
+    yy, month, day, hour, minute, second = packet[4:10]
+    gps_info = packet[10]
+    lat_raw = int.from_bytes(packet[11:15], "big")
+    lon_raw = int.from_bytes(packet[15:19], "big")
+    speed_kmh = packet[19]
+    course_status = int.from_bytes(packet[20:22], "big")
+
+    # GT06 coordinate scale: decimal degrees = raw / 1,800,000.
+    latitude = lat_raw / 1_800_000
+    longitude = lon_raw / 1_800_000
+
+    first_course_byte = packet[20]
+    # Per the supplied protocol: bit 3 = longitude direction (0 east, 1 west);
+    # bit 2 = latitude direction (1 north, 0 south).
+    if first_course_byte & 0x08:
+        longitude = -longitude
+    if not (first_course_byte & 0x04):
+        latitude = -latitude
+
+    # Protocol examples use years as 2000 + YY. Timestamp is tracker UTC time.
+    try:
+        timestamp = datetime(
+            2000 + yy, month, day, hour, minute, second, tzinfo=timezone.utc
+        ).isoformat()
+    except ValueError:
+        timestamp = None
+
+    return {
+        "tracker_time_utc": timestamp,
+        "latitude": round(latitude, 7),
+        "longitude": round(longitude, 7),
+        "speed_kmh": speed_kmh,
+        "course_degrees": course_status & 0x03FF,
+        "gps_info_byte_hex": f"0x{gps_info:02X}",
+    }
+
+
+def extract_packets(buffer: bytearray):
+    """Yield complete 78 78 packets from a TCP byte stream."""
+    packets = []
+    while True:
+        start = buffer.find(b"\x78\x78")
+        if start < 0:
             # Keep one trailing byte in case it is the first byte of a split header.
             if buffer[-1:] == b"\x78":
                 del buffer[:-1]
@@ -110,4 +204,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-
